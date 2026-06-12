@@ -1,0 +1,3 @@
+openai>=1.30.0
+PyGitHub>=2.3.0
+azure-identity>=1.16.0
