@@ -1,0 +1,33 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q5: RBAC / Role Assignment Drift
+// Detects non-standard role assignments on the staging resource group.
+// Approved roles (customize to your org's policy):
+//   Contributor, Reader, Storage Blob Data Contributor,
+//   Key Vault Secrets User, Monitoring Reader
+// ─────────────────────────────────────────────────────────────────────────────
+
+AuthorizationResources
+| where type =~ 'microsoft.authorization/roleassignments'
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where properties.roleDefinitionName !in~ (
+    'Contributor',
+    'Reader',
+    'Storage Blob Data Contributor',
+    'Key Vault Secrets User',
+    'Monitoring Reader',
+    'Key Vault Crypto User',
+    'Storage Queue Data Contributor'
+  )
+| extend principalType = tostring(properties.principalType)
+| extend createdOn     = tostring(properties.createdOn)
+| extend updatedOn     = tostring(properties.updatedOn)
+| project
+    id,
+    resourceGroup,
+    roleName    = tostring(properties.roleDefinitionName),
+    principalId = tostring(properties.principalId),
+    principalType,
+    scope       = tostring(properties.scope),
+    createdOn,
+    updatedOn
+| order by createdOn desc

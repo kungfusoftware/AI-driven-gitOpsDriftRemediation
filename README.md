@@ -1,6 +1,6 @@
 # 🤖 AI-Driven GitOps Drift Remediation Pipeline
 
-> **Autonomous Infrastructure Drift Detection & Remediation for Azure Staging using GitHub Actions + Azure OpenAI + Terraform**
+> **Autonomous Infrastructure Drift Detection & Remediation for Azure Staging using GitHub Actions + Azure Resource Graph + Azure OpenAI + Terraform**
 
 ---
 
@@ -8,7 +8,7 @@
 
 This solution automatically:
 
-1. **Detects** daily Terraform drift in your Azure Staging environment
+1. **Detects** drift instantly via Azure Resource Graph (ARG) KQL queries against the live Azure control plane
 2. **Analyses** the drift with Azure OpenAI (risk level, root cause, impact)
 3. **Generates** Terraform HCL remediation code via an AI agent
 4. **Creates** a GitHub branch and commits the changes
@@ -27,24 +27,92 @@ This solution automatically:
 │  JOB 1: detect-drift                                                │
 │  ┌──────────────────────────────────────────────┐                  │
 │  │  Azure Login (OIDC)                          │                  │
-│  │  → terraform init  (Azure Blob backend)      │                  │
-│  │  → terraform plan  (detect changes)          │                  │
-│  │  → terraform show  (export JSON)             │                  │
+│  │  → arg_query.py   (ARG KQL — fast, live)     │  ← NEW (fast)   │
+│  │  → terraform init (Azure Blob backend)       │                  │
+│  │  → terraform plan (targeted confirmation)    │  ← targeted only │
+│  │  → terraform show (export JSON)              │                  │
 │  │  → summarize_plan.py (one-line summary)      │                  │
-│  └──────────────┬───────────────────────────────┘                  │
-│                 │ drift_detected=true                               │
-│                 ▼                                                   │
+│  └──────────┬──────────────────┬────────────────┘                  │
+│             │ ARG drift found  │ tf plan diff                       │
+│             └────────┬─────────┘                                   │
+│                      │ drift_detected=true                          │
+│                      ▼                                              │
 │  JOB 2: ai-remediation                                              │
 │  ┌──────────────────────────────────────────────┐                  │
-│  │  plan_parser.py  → clean JSON summary        │                  │
+│  │  plan_parser.py  → merge ARG + tf plan data  │                  │
 │  │  openai_client.py→ Azure OpenAI analysis     │                  │
 │  │  openai_client.py→ HCL remediation code      │                  │
 │  │  github_client.py→ create branch             │                  │
 │  │  github_client.py→ commit .tf changes        │                  │
 │  │  terraform validate (verify)                 │                  │
 │  │  github_client.py→ open Pull Request         │                  │
+│  │  👤 Human reviews and approves PR            │                  │
 │  └──────────────────────────────────────────────┘                  │
 └─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why Azure Resource Graph for Drift Detection?
+
+ARG queries the **live Azure control plane directly** — no Terraform state lock needed, and results come back in milliseconds via Kusto (KQL).
+
+| Capability | `terraform plan` | Azure Resource Graph |
+|---|---|---|
+| Source of truth | Terraform state vs. Azure API | Live Azure control plane |
+| Speed | Slow (full API calls per resource) | Fast (KQL query, milliseconds) |
+| Detects manual portal changes | Yes | Yes (instantly) |
+| Detects tag drift | Yes | Yes (richer metadata) |
+| Detects config within a resource | Deep | Surface-level only |
+| Cross-subscription queries | No | Yes |
+| No state lock required | Needs lock | Stateless |
+| Best for | Knowing what Terraform will do | Knowing what Azure actually is |
+
+**Ideal pattern:** ARG detects that drift *happened* → `terraform plan` confirms *what to fix* → AI remediates.
+
+---
+
+## ARG KQL Drift Queries
+
+These queries run in JOB 1 (`arg_query.py`) before `terraform plan` to rapidly surface drift categories.
+
+### 1. Tag compliance drift — resources missing required tags
+
+```kql
+Resources
+| where resourceGroup =~ "rg-myapp-staging"
+| where tags !contains "environment" or tags !contains "managed_by"
+| project name, type, resourceGroup, tags, location
+```
+
+### 2. SKU/size drift — App Services with unexpected SKUs
+
+```kql
+Resources
+| where resourceGroup =~ "rg-myapp-staging"
+| where type =~ "microsoft.web/serverfarms"
+| project name, sku=properties.sku.name, tier=properties.sku.tier
+| where sku !in ("B1","B2","S1")
+```
+
+### 3. Unmanaged resources — not tracked by Terraform state
+
+```kql
+Resources
+| where resourceGroup =~ "rg-myapp-staging"
+| where tags["managed_by"] != "terraform"
+| project name, type, createdTime=properties.createdTime
+```
+
+### 4. Network security group rule drift — overly permissive rules
+
+```kql
+Resources
+| where type =~ "microsoft.network/networksecuritygroups"
+| where resourceGroup =~ "rg-myapp-staging"
+| mv-expand rule=properties.securityRules
+| where rule.properties.access =~ "Allow" and rule.properties.sourceAddressPrefix =~ "*"
+| project nsgName=name, ruleName=rule.name, direction=rule.properties.direction
 ```
 
 ---
@@ -58,9 +126,10 @@ This solution automatically:
 │       └── drift-detection.yml       # Main GitHub Actions workflow
 ├── scripts/
 │   ├── ai_remediate.py               # Main agent orchestrator
+│   ├── arg_query.py                  # Azure Resource Graph KQL queries
 │   ├── openai_client.py              # Azure OpenAI integration
 │   ├── github_client.py              # GitHub API (branch/commit/PR)
-│   ├── plan_parser.py                # Terraform plan JSON parser
+│   ├── plan_parser.py                # Merges ARG + terraform plan JSON
 │   ├── pr_template.py                # PR body builder
 │   ├── summarize_plan.py             # Shell-callable plan summary
 │   └── requirements.txt              # Python dependencies
@@ -169,17 +238,24 @@ export AZURE_OPENAI_DEPLOYMENT="gpt-4o-drift"
 export GITHUB_TOKEN="ghp_..."
 export GITHUB_REPOSITORY="your-org/your-repo"
 
-# Run a local drift detection (requires Azure auth)
+# Step 1: Run ARG queries (fast, live — no state lock needed)
+python scripts/arg_query.py \
+  --subscription-id <SUBSCRIPTION_ID> \
+  --resource-group rg-myapp-staging \
+  --output /tmp/arg_drift.json
+
+# Step 2: Run targeted terraform plan for confirmation (requires Azure auth)
 cd terraform/staging
 terraform init
 terraform plan -out=tfplan.binary
 terraform show -json tfplan.binary > /tmp/tfplan.json
 terraform plan 2>&1 > /tmp/plan_output.txt
 
-# Run the agent in dry-run mode
+# Step 3: Run the agent in dry-run mode (merges ARG + tf plan results)
 python scripts/ai_remediate.py \
   --plan-json /tmp/tfplan.json \
   --plan-text /tmp/plan_output.txt \
+  --arg-drift /tmp/arg_drift.json \
   --working-dir terraform/staging \
   --dry-run
 ```

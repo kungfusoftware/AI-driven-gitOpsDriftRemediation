@@ -1,0 +1,44 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q8: Storage Account Security Drift
+// Flags storage accounts with insecure configuration.
+// Expected secure baseline:
+//   - HTTPS only: true
+//   - Public blob access: false
+//   - Minimum TLS: TLS1_2
+//   - Network ACL default action: Deny
+//   - Shared key access: false (use Entra ID auth only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type =~ 'microsoft.storage/storageaccounts'
+| extend httpsOnly            = tobool(properties.supportsHttpsTrafficOnly)
+| extend publicBlobAccess     = tobool(properties.allowBlobPublicAccess)
+| extend minTlsVersion        = tostring(properties.minimumTlsVersion)
+| extend allowSharedKey       = tobool(properties.allowSharedKeyAccess)
+| extend networkDefaultAction = tostring(properties.networkAcls.defaultAction)
+| extend skuName              = tostring(sku.name)
+| extend violations = pack_array(
+    iff(httpsOnly == false,                  'HTTPS not enforced',            ''),
+    iff(publicBlobAccess == true,            'Public blob access enabled',    ''),
+    iff(minTlsVersion !~ 'TLS1_2',          strcat('TLS version: ', minTlsVersion), ''),
+    iff(networkDefaultAction =~ 'Allow',     'Network ACL allows all traffic', ''),
+    iff(allowSharedKey == true,              'Shared key access enabled',     '')
+  )
+| extend violations = array_sort_asc(set_difference(violations, dynamic([''])))
+| where array_length(violations) > 0
+| project
+    name,
+    type,
+    resourceGroup,
+    location,
+    skuName,
+    tags,
+    httpsOnly,
+    publicBlobAccess,
+    minTlsVersion,
+    allowSharedKey,
+    networkDefaultAction,
+    violations,
+    violationCount = array_length(violations)
+| order by violationCount desc, name asc

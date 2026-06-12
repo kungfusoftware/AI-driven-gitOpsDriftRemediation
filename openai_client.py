@@ -96,13 +96,37 @@ class AzureOpenAIClient:
 
     # ── Public Methods ─────────────────────────────────────────────────────────
 
-    def analyze_drift(self, plan_summary: dict) -> dict:
-        """Send plan summary to AI for risk analysis."""
+    def analyze_drift(self, plan_summary: dict, arg_report: dict | None = None) -> dict:
+        """Send plan summary (and optional ARG findings) to AI for risk analysis."""
         log.info("Requesting drift analysis from Azure OpenAI …")
+
+        arg_section = ""
+        if arg_report and arg_report.get("total_findings", 0) > 0:
+            # Trim findings to avoid token overflow — top 20 by severity
+            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            top_findings = sorted(
+                arg_report.get("findings", []),
+                key=lambda f: sev_order.get(f.get("severity", "LOW"), 9),
+            )[:20]
+            trimmed = {
+                "queried_at":          arg_report.get("queried_at"),
+                "resource_group":      arg_report.get("resource_group"),
+                "total_findings":      arg_report.get("total_findings"),
+                "highest_severity":    arg_report.get("highest_severity"),
+                "summary_by_category": arg_report.get("summary_by_category"),
+                "top_findings":        top_findings,
+            }
+            arg_section = (
+                "\n\n## Azure Resource Graph Live Scan Findings\n"
+                f"```json\n{json.dumps(trimmed, indent=2)}\n```\n"
+                "The ARG findings represent the **live Azure control plane state** "
+                "queried seconds ago — treat these as ground truth for what exists in Azure."
+            )
 
         user_content = (
             "Analyse the following Terraform drift detected in Azure Staging:\n\n"
-            f"```json\n{json.dumps(plan_summary, indent=2)}\n```"
+            f"## Terraform Plan Summary\n```json\n{json.dumps(plan_summary, indent=2)}\n```"
+            f"{arg_section}"
         )
 
         response = self._chat(
@@ -116,7 +140,12 @@ class AzureOpenAIClient:
         log.info("Analysis complete — risk: %s", analysis.get("risk_level"))
         return analysis
 
-    def generate_remediation(self, plan_summary: dict, analysis: dict) -> dict:
+    def generate_remediation(
+        self,
+        plan_summary: dict,
+        analysis: dict,
+        arg_report: dict | None = None,
+    ) -> dict:
         """Generate Terraform HCL remediation code for the detected drift."""
         log.info("Requesting remediation code from Azure OpenAI …")
 
@@ -134,11 +163,19 @@ class AzureOpenAIClient:
                 "verification_commands": [],
             }
 
+        arg_section = ""
+        if arg_report and arg_report.get("total_findings", 0) > 0:
+            arg_section = (
+                "\n\n## ARG Live Findings (use these as the authoritative live state)\n"
+                f"```json\n{json.dumps(arg_report.get('top_findings', arg_report.get('findings', []))[:10], indent=2)}\n```"
+            )
+
         user_content = (
             "## Drift Summary\n"
             f"```json\n{json.dumps(plan_summary, indent=2)}\n```\n\n"
             "## AI Analysis\n"
-            f"```json\n{json.dumps(analysis, indent=2)}\n```\n\n"
+            f"```json\n{json.dumps(analysis, indent=2)}\n```"
+            f"{arg_section}\n\n"
             "Generate the Terraform HCL remediation changes."
         )
 

@@ -1,0 +1,26 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q4: NSG Rule Drift
+// Detects Network Security Group rules with overly permissive source addresses.
+// Flags any Allow rule sourced from: *, Internet, or 0.0.0.0/0
+// ─────────────────────────────────────────────────────────────────────────────
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type =~ 'microsoft.network/networksecuritygroups'
+| mv-expand rule = properties.securityRules
+| where rule.properties.access =~ 'Allow'
+| where rule.properties.sourceAddressPrefix in~ ('*', 'Internet', '0.0.0.0/0')
+| extend isCriticalPort = rule.properties.destinationPortRange in ('22', '3389', '443', '80', '*')
+| project
+    nsgName          = name,
+    resourceGroup,
+    location,
+    ruleName         = tostring(rule.name),
+    direction        = tostring(rule.properties.direction),
+    priority         = toint(rule.properties.priority),
+    protocol         = tostring(rule.properties.protocol),
+    sourcePrefix     = tostring(rule.properties.sourceAddressPrefix),
+    destPortRange    = tostring(rule.properties.destinationPortRange),
+    isCriticalPort,
+    description      = tostring(rule.properties.description)
+| order by isCriticalPort desc, priority asc

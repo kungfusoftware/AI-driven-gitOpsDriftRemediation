@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plan-json",    required=True, help="Path to tfplan.json")
     p.add_argument("--plan-text",    required=True, help="Path to plan text output")
     p.add_argument("--working-dir",  required=True, help="Terraform working directory")
+    p.add_argument("--arg-report",   default=None,  help="Path to arg_drift_report.json (optional)")
     p.add_argument("--dry-run",      action="store_true", help="Analyse only, no commits")
     return p.parse_args()
 
@@ -80,11 +81,24 @@ def main():
         summary["counts"]["destroy"],
     )
 
+    # ── Step 1b: Load ARG report if available ─────────────────────────────────
+    arg_report: dict | None = None
+    if args.arg_report and Path(args.arg_report).exists():
+        with open(args.arg_report) as f:
+            arg_report = json.load(f)
+        log.info(
+            "ARG report loaded — %d findings, highest severity: %s",
+            arg_report.get("total_findings", 0),
+            arg_report.get("highest_severity", "NONE"),
+        )
+    else:
+        log.info("No ARG report provided — proceeding with Terraform plan data only.")
+
     # ── Step 2: Send to Azure OpenAI for analysis & remediation code ──────────
-    log.info("Step 2: Sending plan to Azure OpenAI for analysis …")
+    log.info("Step 2: Sending plan + ARG findings to Azure OpenAI for analysis …")
     ai_client = AzureOpenAIClient()
 
-    analysis = ai_client.analyze_drift(summary)
+    analysis = ai_client.analyze_drift(summary, arg_report=arg_report)
     log.info("AI risk level: %s", analysis.get("risk_level", "unknown"))
 
     log.info("Step 2b: Requesting remediation Terraform code …")

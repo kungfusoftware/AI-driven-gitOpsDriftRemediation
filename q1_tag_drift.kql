@@ -1,0 +1,35 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q1: Tag Drift
+// Detects resources missing required tags or with incorrect managed_by value.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Required tags (customize for your org):
+//   - environment
+//   - managed_by   (expected value: "terraform")
+//   - team
+//
+// Parameters (replace before running in Azure Portal):
+//   {{RESOURCE_GROUP}}  = rg-myapp-staging
+//   {{MANAGED_BY}}      = terraform
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type !startswith 'microsoft.resources/'
+| where isnull(tags['environment'])
+     or isnull(tags['managed_by'])
+     or isnull(tags['team'])
+     or tags['managed_by'] !~ '{{MANAGED_BY}}'
+| extend tagIssues = bag_pack(
+    'missing_environment', isnull(tags['environment']),
+    'missing_managed_by',  isnull(tags['managed_by']),
+    'missing_team',        isnull(tags['team']),
+    'wrong_managed_by',    tags['managed_by'] !~ '{{MANAGED_BY}}'
+  )
+| project
+    name,
+    type,
+    resourceGroup,
+    location,
+    tags,
+    tagIssues
+| order by type asc, name asc

@@ -1,0 +1,32 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q6: Missing Resource Locks
+// Critical resource types that should have a CanNotDelete lock but don't.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type in~ (
+    'microsoft.sql/servers',
+    'microsoft.storage/storageaccounts',
+    'microsoft.keyvault/vaults',
+    'microsoft.network/virtualnetworks',
+    'microsoft.network/applicationgateways',
+    'microsoft.servicebus/namespaces'
+  )
+| join kind=leftouter (
+    Resources
+    | where type =~ 'microsoft.authorization/locks'
+    | where resourceGroup =~ '{{RESOURCE_GROUP}}'
+    | where properties.level =~ 'CanNotDelete'
+    | extend parentId = tostring(split(id, '/providers/')[0])
+    | project parentId, lockLevel = tostring(properties.level), lockName = name
+  ) on $left.id == $right.parentId
+| where isnull(lockLevel)
+| project
+    name,
+    type,
+    resourceGroup,
+    location,
+    tags,
+    lockStatus = 'missing CanNotDelete lock'
+| order by type asc, name asc

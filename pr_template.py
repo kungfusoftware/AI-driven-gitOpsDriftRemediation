@@ -24,6 +24,7 @@ def build_pr_body(
     remediation: dict,
     verify_ok: bool,
     verify_output: str,
+    arg_report: dict | None = None,
 ) -> str:
     risk      = analysis.get("risk_level", "UNKNOWN")
     risk_icon = RISK_EMOJI.get(risk, "⚪")
@@ -32,6 +33,30 @@ def build_pr_body(
 
     file_changes  = remediation.get("file_changes",  [])
     skipped       = remediation.get("skipped_changes", [])
+
+    # ARG findings block
+    arg_block = []
+    if arg_report and arg_report.get("total_findings", 0) > 0:
+        sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
+        arg_block = [
+            f"---",
+            f"",
+            f"### 🔍 Azure Resource Graph Live Findings ({arg_report['total_findings']} total · highest: {risk_icon} `{arg_report['highest_severity']}`)",
+            f"",
+            f"| Severity | Category | Resource | Description |",
+            f"|----------|----------|----------|-------------|",
+        ]
+        for f in arg_report.get("findings", [])[:15]:
+            sev_icon = sev_emoji.get(f.get("severity",""), "⚪")
+            arg_block.append(
+                f"| {sev_icon} {f.get('severity','')} "
+                f"| {f.get('category','')} "
+                f"| `{f.get('resource_name','')}` "
+                f"| {f.get('description','')[:100]} |"
+            )
+        if arg_report["total_findings"] > 15:
+            arg_block.append(f"| … | … | … | *+{arg_report['total_findings']-15} more findings in artifact* |")
+        arg_block.append("")
 
     lines = [
         f"## 🤖 AI-Driven Infrastructure Drift Remediation",
@@ -51,6 +76,9 @@ def build_pr_body(
         f"| 🔄 Replace | {counts.get('replace', 0)} |",
         f"| ⚠️  Drifted | {counts.get('drift', 0)} |",
         f"",
+    ]
+    lines += arg_block
+    lines += [
         f"---",
         f"",
         f"### 🧠 AI Analysis",

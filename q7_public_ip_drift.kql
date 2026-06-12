@@ -1,0 +1,33 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q7: Public IP Drift
+// Finds all public IPs in staging — any not attached to an approved
+// load balancer or Application Gateway warrants investigation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type =~ 'microsoft.network/publicipaddresses'
+| extend allocationMethod  = tostring(properties.publicIPAllocationMethod)
+| extend ipAddress         = tostring(properties.ipAddress)
+| extend associatedTo      = tostring(properties.ipConfiguration.id)
+| extend associatedToType  = case(
+    associatedTo contains 'loadbalancers',         'Load Balancer',
+    associatedTo contains 'applicationgateways',   'Application Gateway',
+    associatedTo contains 'networkinterfaces',      'NIC (VM)',
+    associatedTo contains 'bastionhosts',           'Bastion Host',
+    associatedTo == '',                             'Unattached',
+    'Other'
+  )
+| extend isExpected = associatedToType in ('Load Balancer', 'Application Gateway', 'Bastion Host')
+| project
+    name,
+    type,
+    resourceGroup,
+    location,
+    tags,
+    ipAddress,
+    allocationMethod,
+    associatedToType,
+    associatedTo,
+    isExpected
+| order by isExpected asc, name asc

@@ -1,0 +1,44 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Q3: Unmanaged Resources
+// Resources in the staging RG that are NOT tagged as managed by Terraform.
+// These are likely manually created via the Azure Portal or CLI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Resources
+| where resourceGroup =~ '{{RESOURCE_GROUP}}'
+| where type !startswith 'microsoft.resources/'
+| where type !in~ (
+    'microsoft.authorization/locks',
+    'microsoft.authorization/roleassignments',
+    'microsoft.insights/diagnosticsettings'
+  )
+| where isnull(tags['managed_by'])
+     or tags['managed_by'] !~ '{{MANAGED_BY}}'
+| extend createdTime = coalesce(
+    tostring(properties.creationTime),
+    tostring(properties.timeCreated),
+    tostring(properties.createdAt),
+    ''
+  )
+| extend ageHours = iff(
+    createdTime != '',
+    datetime_diff('hour', now(), todatetime(createdTime)),
+    int(null)
+  )
+| extend ageLabel = case(
+    isnull(ageHours),         'unknown age',
+    ageHours < 1,             'created < 1h ago',
+    ageHours < 24,            'created today',
+    ageHours < 168,           'created this week',
+    'created > 1 week ago'
+  )
+| project
+    name,
+    type,
+    resourceGroup,
+    location,
+    tags,
+    createdTime,
+    ageHours,
+    ageLabel
+| order by ageHours asc

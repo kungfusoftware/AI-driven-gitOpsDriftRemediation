@@ -3,34 +3,139 @@ name: AI Drift Detection & Remediation
 on:
   schedule:
     - cron: "0 6 * * *"   # Daily at 06:00 UTC
-  workflow_dispatch:       # Allow manual trigger
+  workflow_dispatch:
     inputs:
       dry_run:
         description: "Dry run (detect only, no PR)"
+        required: false
+        default: "false"
+      skip_arg:
+        description: "Skip ARG pre-flight and run terraform plan directly"
         required: false
         default: "false"
 
 permissions:
   contents: write
   pull-requests: write
-  id-token: write          # Required for OIDC Azure login
+  id-token: write
 
 env:
-  TF_VERSION: "1.7.5"
+  TF_VERSION:     "1.7.5"
   PYTHON_VERSION: "3.11"
-  WORKING_DIR: "./terraform/staging"
-  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  WORKING_DIR:    "./terraform/staging"
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-  ARM_USE_OIDC: "true"
+  ARM_USE_OIDC:   "true"
+  STAGING_RESOURCE_GROUP: ${{ secrets.STAGING_RESOURCE_GROUP }}
 
 jobs:
-  # ──────────────────────────────────────────────
-  # JOB 1: Detect Drift
-  # ──────────────────────────────────────────────
-  detect-drift:
-    name: "1 · Detect Infrastructure Drift"
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1: ARG Pre-flight — fast live query against Azure control plane
+  # Runs in ~10s. If no drift found here, Terraform plan is skipped entirely.
+  # ──────────────────────────────────────────────────────────────────────────
+  arg-preflight:
+    name: "1 · ARG Live Drift Scan"
     runs-on: ubuntu-latest
+    outputs:
+      arg_drift_detected: ${{ steps.arg_check.outputs.arg_drift_detected }}
+      arg_highest_severity: ${{ steps.arg_check.outputs.arg_highest_severity }}
+      arg_finding_count: ${{ steps.arg_check.outputs.arg_finding_count }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Azure Resource Graph drift scan
+        id: arg_check
+        env:
+          STAGING_RESOURCE_GROUP: ${{ secrets.STAGING_RESOURCE_GROUP }}
+          ARM_SUBSCRIPTION_ID:    ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          set +e
+          python scripts/arg_detector.py --output /tmp/arg_drift_report.json
+          ARG_EXIT=$?
+          set -e
+
+          if [ "${{ github.event.inputs.skip_arg }}" == "true" ]; then
+            echo "arg_drift_detected=skipped" >> $GITHUB_OUTPUT
+            echo "ARG scan skipped by workflow input."
+            exit 0
+          fi
+
+          if [ "$ARG_EXIT" == "2" ]; then
+            echo "arg_drift_detected=true" >> $GITHUB_OUTPUT
+            SEVERITY=$(python3 -c "import json; d=json.load(open('/tmp/arg_drift_report.json')); print(d['highest_severity'])")
+            COUNT=$(python3 -c "import json; d=json.load(open('/tmp/arg_drift_report.json')); print(d['total_findings'])")
+            echo "arg_highest_severity=${SEVERITY}" >> $GITHUB_OUTPUT
+            echo "arg_finding_count=${COUNT}"        >> $GITHUB_OUTPUT
+            echo "::warning::ARG scan found ${COUNT} drift finding(s) — highest severity: ${SEVERITY}"
+          elif [ "$ARG_EXIT" == "0" ]; then
+            echo "arg_drift_detected=false" >> $GITHUB_OUTPUT
+            echo "arg_highest_severity=NONE" >> $GITHUB_OUTPUT
+            echo "arg_finding_count=0"       >> $GITHUB_OUTPUT
+            echo "✅ ARG scan: No live drift detected."
+          else
+            echo "::error::ARG scan encountered an error (exit $ARG_EXIT). Falling through to terraform plan."
+            echo "arg_drift_detected=error" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload ARG report
+        if: steps.arg_check.outputs.arg_drift_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arg-drift-report
+          path: /tmp/arg_drift_report.json
+          retention-days: 7
+
+      - name: Write ARG summary
+        if: always()
+        run: |
+          echo "## 🔍 Azure Resource Graph Pre-flight Scan" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/arg_drift_report.json ]; then
+            python3 - << 'PY'
+import json, sys
+d = json.load(open('/tmp/arg_drift_report.json'))
+print(f"- **Findings:** {d['total_findings']}")
+print(f"- **Highest Severity:** {d['highest_severity']}")
+print(f"- **Queried At:** {d['queried_at']}")
+print()
+print("| Category | Count |")
+print("|----------|-------|")
+for cat, cnt in d.get('summary_by_category', {}).items():
+    print(f"| {cat} | {cnt} |")
+PY
+          else
+            echo "No ARG report generated."
+          fi >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2: Terraform Plan — only runs if ARG found drift (or was skipped/errored)
+  # ──────────────────────────────────────────────────────────────────────────
+  detect-drift:
+    name: "2 · Terraform Plan (Drift Confirmation)"
+    runs-on: ubuntu-latest
+    needs: arg-preflight
+    if: |
+      needs.arg-preflight.outputs.arg_drift_detected == 'true'  ||
+      needs.arg-preflight.outputs.arg_drift_detected == 'skipped' ||
+      needs.arg-preflight.outputs.arg_drift_detected == 'error'
     outputs:
       drift_detected: ${{ steps.check_drift.outputs.drift_detected }}
       plan_summary:   ${{ steps.check_drift.outputs.plan_summary }}
@@ -52,6 +157,22 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Download ARG report (if available)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: arg-drift-report
+          path: /tmp/
+
       - name: Terraform Init
         working-directory: ${{ env.WORKING_DIR }}
         run: |
@@ -61,7 +182,7 @@ jobs:
             -backend-config="container_name=${{ secrets.TF_BACKEND_CONTAINER }}" \
             -backend-config="key=staging.terraform.tfstate"
 
-      - name: Terraform Plan (Drift Detection)
+      - name: Terraform Plan (Drift Confirmation)
         id: tf_plan
         working-directory: ${{ env.WORKING_DIR }}
         run: |
@@ -83,23 +204,25 @@ jobs:
         id: check_drift
         run: |
           EXIT_CODE="${{ steps.tf_plan.outputs.exit_code }}"
-          # 0 = no changes, 1 = error, 2 = changes present
-          if [ "$EXIT_CODE" == "2" ]; then
+          ARG_FINDINGS="${{ needs.arg-preflight.outputs.arg_finding_count }}"
+
+          # Drift if terraform says so (exit 2) OR if ARG found live findings
+          if [ "$EXIT_CODE" == "2" ] || [ "${ARG_FINDINGS:-0}" -gt "0" ] 2>/dev/null; then
             echo "drift_detected=true" >> $GITHUB_OUTPUT
             SUMMARY=$(python3 scripts/summarize_plan.py /tmp/tfplan.json)
             echo "plan_summary=${SUMMARY}" >> $GITHUB_OUTPUT
-            echo "::warning::Infrastructure drift detected in Staging!"
+            echo "::warning::Drift confirmed — TF exit=${EXIT_CODE}  ARG findings=${ARG_FINDINGS}"
           elif [ "$EXIT_CODE" == "0" ]; then
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "plan_summary=No drift detected" >> $GITHUB_OUTPUT
-            echo "✅ No drift detected."
+            echo "✅ No drift detected by Terraform plan."
           else
             echo "drift_detected=error" >> $GITHUB_OUTPUT
             echo "::error::Terraform plan failed with exit code $EXIT_CODE"
             exit 1
           fi
 
-      - name: Upload plan artifacts
+      - name: Upload combined artifacts
         if: steps.check_drift.outputs.drift_detected == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -109,13 +232,13 @@ jobs:
             /tmp/plan_output.txt
           retention-days: 7
 
-  # ──────────────────────────────────────────────
-  # JOB 2: AI Remediation Agent
-  # ──────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3: AI Remediation Agent
+  # ──────────────────────────────────────────────────────────────────────────
   ai-remediation:
-    name: "2 · AI Remediation Agent"
+    name: "3 · AI Remediation Agent"
     runs-on: ubuntu-latest
-    needs: detect-drift
+    needs: [arg-preflight, detect-drift]
     if: needs.detect-drift.outputs.drift_detected == 'true' && github.event.inputs.dry_run != 'true'
 
     steps:
@@ -134,44 +257,56 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r scripts/requirements.txt
 
-      - name: Download plan artifacts
+      - name: Download terraform plan artifacts
         uses: actions/download-artifact@v4
         with:
           name: terraform-plan
           path: /tmp/
 
+      - name: Download ARG report (if available)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: arg-drift-report
+          path: /tmp/
+
       - name: Run AI Remediation Agent
         env:
-          AZURE_OPENAI_ENDPOINT:    ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:     ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_DEPLOYMENT:  ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
-          GITHUB_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY:        ${{ github.repository }}
-          TF_WORKING_DIR:           ${{ env.WORKING_DIR }}
+          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          GITHUB_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:       ${{ github.repository }}
+          TF_WORKING_DIR:          ${{ env.WORKING_DIR }}
+          STAGING_RESOURCE_GROUP:  ${{ secrets.STAGING_RESOURCE_GROUP }}
+          ARM_SUBSCRIPTION_ID:     ${{ secrets.ARM_SUBSCRIPTION_ID }}
         run: |
           python scripts/ai_remediate.py \
             --plan-json /tmp/tfplan.json \
             --plan-text /tmp/plan_output.txt \
+            --arg-report /tmp/arg_drift_report.json \
             --working-dir "${{ env.WORKING_DIR }}"
 
-      - name: Post drift summary to job summary
+      - name: Post remediation summary
         if: always()
         run: |
           echo "## 🤖 AI Drift Remediation Summary" >> $GITHUB_STEP_SUMMARY
           cat /tmp/remediation_summary.md >> $GITHUB_STEP_SUMMARY || echo "No summary generated." >> $GITHUB_STEP_SUMMARY
 
-  # ──────────────────────────────────────────────
-  # JOB 3: Notify on No Drift
-  # ──────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4: Clean — ARG found nothing, terraform plan skipped
+  # ──────────────────────────────────────────────────────────────────────────
   notify-clean:
-    name: "3 · Notify Clean State"
+    name: "4 · Notify Clean State"
     runs-on: ubuntu-latest
-    needs: detect-drift
-    if: needs.detect-drift.outputs.drift_detected == 'false'
+    needs: arg-preflight
+    if: needs.arg-preflight.outputs.arg_drift_detected == 'false'
 
     steps:
       - name: Post clean status
         run: |
           echo "## ✅ No Infrastructure Drift Detected" >> $GITHUB_STEP_SUMMARY
-          echo "Staging environment matches Terraform state. No action required." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ARG live scan found **0 findings** — Terraform plan skipped (fast exit)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Checked at:** $(date -u)" >> $GITHUB_STEP_SUMMARY
